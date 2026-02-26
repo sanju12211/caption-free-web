@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -14,18 +15,24 @@ app = FastAPI(title="QuantumOS API", version="1.0.0")
 # Allow frontend to talk to backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- Security Config ---
-SECRET_KEY = "quantumos-super-secret-key-2024"
+SECRET_KEY = os.getenv("SECRET_KEY", "quantumos-super-secret-key-2024")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Use pbkdf2_sha256 to avoid OS-specific bcrypt issues
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "quantumos.db")
@@ -140,9 +147,55 @@ def create_token(data: dict):
 
 def get_user_by_email(email: str):
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    conn.close()
-    return user
+    try:
+        return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    finally:
+        conn.close()
+
+
+def ensure_test_user():
+    """টেস্টের জন্য একটা ইউজার তৈরি (না থাকলে)।"""
+    try:
+        test_email = "test@example.com"
+        test_pass = "test1234"
+        existing = get_user_by_email(test_email)
+        conn = get_db()
+        try:
+            if existing:
+                # Update password to ensure it's correct
+                hashed = hash_password(test_pass)
+                conn.execute(
+                    "UPDATE users SET hashed_password = ? WHERE email = ?",
+                    (hashed, test_email)
+                )
+                conn.commit()
+                # Verify it works
+                test_verify = verify_password(test_pass, hashed)
+                print(f"[OK] Test user updated: {test_email} / {test_pass} (verify: {test_verify})")
+            else:
+                # Create new
+                hashed = hash_password(test_pass)
+                conn.execute(
+                    "INSERT INTO users (full_name, email, hashed_password) VALUES (?, ?, ?)",
+                    ("Test User", test_email, hashed),
+                )
+                conn.commit()
+                # Verify it works
+                test_verify = verify_password(test_pass, hashed)
+                print(f"[OK] Test user created: {test_email} / {test_pass} (verify: {test_verify})")
+        except Exception as e:
+            print(f"[ERROR] Error creating/updating test user: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[ERROR] Error in ensure_test_user: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# Test user will be created on first request or via startup event
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     if not token:
@@ -162,12 +215,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 # --- Schemas ---
 class RegisterRequest(BaseModel):
     full_name: str
-    email: str
+    email: EmailStr
     password: str
 
 class CaptionRequest(BaseModel):
     keyword: str
     category: str = "default"
+
+class UpdateProfileRequest(BaseModel):
+    full_name: str | None = None
+    bio: str | None = None
 
 # --- Routes ---
 
@@ -175,26 +232,326 @@ class CaptionRequest(BaseModel):
 def root():
     return {"message": "QuantumOS API is running! 🚀"}
 
+
+# --- Dashboard (backend stats) ---
+def get_dashboard_stats():
+    conn = get_db()
+    try:
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        captions = conn.execute("SELECT COUNT(*) FROM captions").fetchone()[0]
+        recent = conn.execute(
+            "SELECT id, user_id, keyword, category, caption, created_at FROM captions ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        recent_users = conn.execute(
+            "SELECT id, full_name, email, created_at FROM users ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        return {
+            "total_users": users,
+            "total_captions": captions,
+            "recent_captions": [dict(r) for r in recent],
+            "recent_users": [dict(r) for r in recent_users],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/dashboard/stats")
+def dashboard_stats():
+    return get_dashboard_stats()
+
+@app.get("/debug/test-user")
+def debug_test_user():
+    """ডিবাগ: টেস্ট ইউজার আছে কিনা চেক করুন।"""
+    user = get_user_by_email("test@example.com")
+    if user:
+        return {
+            "exists": True,
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "id": user["id"]
+        }
+    return {"exists": False, "message": "Test user not found. Creating..."}
+
+@app.post("/debug/create-test-user")
+def create_test_user_endpoint():
+    """টেস্ট ইউজার তৈরি/রিসেট করুন (পাসওয়ার্ড: test1234)।"""
+    try:
+        test_email = "test@example.com"
+        test_pass = "test1234"
+        existing = get_user_by_email(test_email)
+        conn = get_db()
+        try:
+            hashed = hash_password(test_pass)
+            if existing:
+                # Update existing user
+                conn.execute(
+                    "UPDATE users SET hashed_password = ?, full_name = ? WHERE email = ?",
+                    (hashed, "Test User", test_email)
+                )
+                conn.commit()
+                verify_ok = verify_password(test_pass, hashed)
+                return {
+                    "message": "Test user password reset!",
+                    "email": test_email,
+                    "password": test_pass,
+                    "password_verify": verify_ok
+                }
+            else:
+                # Create new
+                conn.execute(
+                    "INSERT INTO users (full_name, email, hashed_password) VALUES (?, ?, ?)",
+                    ("Test User", test_email, hashed),
+                )
+                conn.commit()
+                verify_ok = verify_password(test_pass, hashed)
+                return {
+                    "message": "Test user created!",
+                    "email": test_email,
+                    "password": test_pass,
+                    "password_verify": verify_ok
+                }
+        finally:
+            conn.close()
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QuantumOS - Backend Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #6366f1;
+      --secondary: #a855f7;
+      --bg-dark: #0f172a;
+      --bg-card: rgba(30, 41, 59, 0.8);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --glass: rgba(255,255,255,0.1);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Outfit', sans-serif; }
+    body {
+      min-height: 100vh;
+      background: var(--bg-dark);
+      color: var(--text-main);
+      background-image: radial-gradient(circle at 0% 0%, rgba(99,102,241,0.15) 0, transparent 50%),
+        radial-gradient(circle at 100% 100%, rgba(168,85,247,0.12) 0, transparent 50%);
+    }
+    .container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1.5rem 0;
+      border-bottom: 1px solid var(--glass);
+      margin-bottom: 2rem;
+    }
+    .logo {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(to right, var(--primary), var(--secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .badge {
+      background: rgba(99,102,241,0.2);
+      color: var(--primary);
+      padding: 0.35rem 0.75rem;
+      border-radius: 99px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    h1 { font-size: 1.75rem; margin-bottom: 2rem; color: var(--text-main); }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2.5rem;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--glass);
+      border-radius: 20px;
+      padding: 1.75rem;
+      backdrop-filter: blur(12px);
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .card:hover { transform: translateY(-4px); border-color: rgba(99,102,241,0.3); }
+    .card .icon { font-size: 2rem; margin-bottom: 0.75rem; }
+    .card .label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.25rem; }
+    .card .value { font-size: 2.25rem; font-weight: 700; background: linear-gradient(135deg, var(--primary), var(--secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .section-title { font-size: 1.2rem; margin-bottom: 1rem; color: var(--text-muted); }
+    .table-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--glass);
+      border-radius: 20px;
+      overflow: hidden;
+      backdrop-filter: blur(12px);
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 1rem 1.25rem; text-align: left; }
+    th { background: rgba(99,102,241,0.15); color: var(--primary); font-weight: 600; font-size: 0.85rem; }
+    tr:not(:last-child) td { border-bottom: 1px solid var(--glass); }
+    td { color: var(--text-muted); font-size: 0.9rem; }
+    td.caption { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-main); }
+    .loading { text-align: center; padding: 3rem; color: var(--text-muted); }
+    .error { color: #f43f5e; padding: 1rem; background: rgba(244,63,94,0.1); border-radius: 12px; margin-top: 1rem; }
+    .links { margin-top: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+    .links a { color: var(--primary); text-decoration: none; font-weight: 600; }
+    .links a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="logo">QuantumOS</span>
+      <div style="display: flex; align-items: center; gap: 1rem;">
+        <span id="user-badge" class="badge" style="display: none;">Logged in as …</span>
+        <span class="badge">Backend Dashboard</span>
+      </div>
+    </header>
+    <h1>📊 API Overview</h1>
+    <div id="content">
+      <div class="loading">Loading stats…</div>
+    </div>
+    <div class="links">
+      <a href="/">← API Root</a>
+      <a href="/docs">API Docs (Swagger)</a>
+      <a href="/redoc">ReDoc</a>
+    </div>
+  </div>
+  <script>
+    (function() {
+      var params = new URLSearchParams(location.search);
+      var token = params.get('token');
+      if (token) {
+        fetch('/me', { headers: { 'Authorization': 'Bearer ' + token } })
+          .then(r => r.ok ? r.json() : null)
+          .then(u => {
+            if (u) {
+              var el = document.getElementById('user-badge');
+              if (el) { el.textContent = 'Logged in as ' + (u.full_name || u.email || 'User'); el.style.display = 'inline-block'; }
+            }
+          })
+          .catch(() => {});
+      }
+    })();
+    fetch('/dashboard/stats')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('content').innerHTML = `
+          <div class="cards">
+            <div class="card">
+              <div class="icon">👥</div>
+              <div class="label">Total Users</div>
+              <div class="value">${data.total_users}</div>
+            </div>
+            <div class="card">
+              <div class="icon">✍️</div>
+              <div class="label">Total Captions</div>
+              <div class="value">${data.total_captions}</div>
+            </div>
+          </div>
+          <div class="section-title">Registered Users (যে ইউজার লগইন/অ্যাকাউন্ট করেছে)</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Joined</th></tr></thead>
+              <tbody>
+                ${(data.recent_users || []).map(u => `
+                  <tr>
+                    <td>${u.id}</td>
+                    <td>${(u.full_name || '-').replace(/</g, '&lt;')}</td>
+                    <td>${(u.email || '-').replace(/</g, '&lt;')}</td>
+                    <td>${u.created_at || '-'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+            ${!(data.recent_users && data.recent_users.length) ? '<div class="loading">No users yet.</div>' : ''}
+          </div>
+          <div class="section-title">Recent Captions (last 10)</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ID</th><th>User ID</th><th>Keyword</th><th>Category</th><th>Caption</th><th>Created</th></tr></thead>
+              <tbody>
+                ${(data.recent_captions || []).map(r => `
+                  <tr>
+                    <td>${r.id}</td>
+                    <td>${r.user_id}</td>
+                    <td>${r.keyword || '-'}</td>
+                    <td>${r.category || '-'}</td>
+                    <td class="caption" title="${(r.caption || '').replace(/"/g, '&quot;')}">${r.caption || '-'}</td>
+                    <td>${r.created_at || '-'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+            ${!(data.recent_captions && data.recent_captions.length) ? '<div class="loading">No captions yet.</div>' : ''}
+          </div>
+        `;
+      })
+      .catch(err => {
+        document.getElementById('content').innerHTML = '<div class="error">Failed to load stats: ' + err.message + '</div>';
+      });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    # Ensure test user exists (lazy initialization)
+    try:
+        ensure_test_user()
+    except:
+        pass
+    return DASHBOARD_HTML
+
 @app.post("/register")
 def register(req: RegisterRequest):
     if get_user_by_email(req.email):
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed = hash_password(req.password)
     conn = get_db()
-    conn.execute(
-        "INSERT INTO users (full_name, email, hashed_password) VALUES (?, ?, ?)",
-        (req.full_name, req.email, hashed)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO users (full_name, email, hashed_password) VALUES (?, ?, ?)",
+            (req.full_name, req.email, hashed)
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "Account created successfully! ✅"}
 
 @app.post("/login")
 def login(form: OAuth2PasswordRequestForm = Depends()):
-    user = get_user_by_email(form.username)
-    if not user or not verify_password(form.password, user["hashed_password"]):
+    # Ensure test user exists (lazy initialization)
+    try:
+        ensure_test_user()
+    except:
+        pass
+    email = form.username.strip().lower()
+    password = form.password
+    user = get_user_by_email(email)
+    if not user:
+        print(f"[LOGIN] User not found: {email}")
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    # Debug: print password check
+    is_valid = verify_password(password, user["hashed_password"])
+    print(f"[LOGIN] Attempt: email={email}, password_match={is_valid}")
+    if not is_valid:
+        print(f"[LOGIN] Password mismatch for: {email}")
         raise HTTPException(status_code=400, detail="Incorrect email or password")
     token = create_token({"sub": user["email"]})
+    print(f"[LOGIN] Success: {email}")
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -229,34 +586,40 @@ def generate_caption(req: CaptionRequest, current_user=Depends(get_current_user)
 
     # Save to DB
     conn = get_db()
-    conn.execute(
-        "INSERT INTO captions (user_id, keyword, category, caption) VALUES (?, ?, ?, ?)",
-        (current_user["id"], keyword, category, caption)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO captions (user_id, keyword, category, caption) VALUES (?, ?, ?, ?)",
+            (current_user["id"], keyword, category, caption)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     return {"caption": caption, "category": category, "keyword": keyword}
 
 @app.get("/my-captions")
 def my_captions(current_user=Depends(get_current_user)):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM captions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
-        (current_user["id"],)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        rows = conn.execute(
+            "SELECT * FROM captions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
+            (current_user["id"],)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 @app.put("/profile")
-def update_profile(data: dict, current_user=Depends(get_current_user)):
-    full_name = data.get("full_name", current_user["full_name"])
-    bio = data.get("bio", current_user["bio"])
+def update_profile(data: UpdateProfileRequest, current_user=Depends(get_current_user)):
+    full_name = data.full_name if data.full_name is not None else current_user["full_name"]
+    bio = data.bio if data.bio is not None else current_user["bio"]
     conn = get_db()
-    conn.execute(
-        "UPDATE users SET full_name = ?, bio = ? WHERE id = ?",
-        (full_name, bio, current_user["id"])
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "UPDATE users SET full_name = ?, bio = ? WHERE id = ?",
+            (full_name, bio, current_user["id"])
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "Profile updated! ✅"}
